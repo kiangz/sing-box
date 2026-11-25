@@ -2,10 +2,13 @@ package mdns
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -238,10 +241,23 @@ func (t *Transport) exchangeTarget(ctx context.Context, target queryTarget, rawM
 func (t *Transport) listenPacket(ctx context.Context, target queryTarget) (net.PacketConn, net.Addr, error) {
 	var listenConfig net.ListenConfig
 	listenConfig.Control = control.Append(listenConfig.Control, control.BindToInterface(t.networkManager.InterfaceFinder(), target.iface.Name, target.iface.Index))
+	listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
+	return newMulticastConn(ctx, listenConfig, target)
+}
+
+// newMulticastConn creates the socket used for an mDNS query.
+//
+// Responses are multicasted to 224.0.0.251:5353 / [ff02::fb]:5353. A socket
+// bound to an ephemeral port never receives those datagrams, and the interface
+// drops multicast traffic unless the socket joins the group. Therefore bind
+// mdnsPort (shared with other mDNS responders via SO_REUSEADDR) and join the
+// group on the queried interface.
+func newMulticastConn(ctx context.Context, listenConfig net.ListenConfig, target queryTarget) (net.PacketConn, net.Addr, error) {
 	netInterface := target.iface.NetInterface()
+	listenAddress := net.JoinHostPort("", strconv.Itoa(mdnsPort))
 	switch target.family {
 	case "udp4":
-		packetConn, err := listenConfig.ListenPacket(ctx, "udp4", "0.0.0.0:0")
+		packetConn, err := listenMDNSPacket(ctx, listenConfig, "udp4", listenAddress)
 		if err != nil {
 			return nil, nil, E.Cause(err, "mdns: listen on ", target.iface.Name, " udp4")
 		}
@@ -252,9 +268,14 @@ func (t *Transport) listenPacket(ctx context.Context, target queryTarget) (net.P
 			return nil, nil, E.Cause(err, "mdns: set multicast interface on ", target.iface.Name, " udp4")
 		}
 		_ = ipv4Conn.SetMulticastTTL(255)
+		err = ipv4Conn.JoinGroup(&netInterface, &net.UDPAddr{IP: mdnsGroupIPv4})
+		if err != nil {
+			packetConn.Close()
+			return nil, nil, E.Cause(err, "mdns: join multicast group on ", target.iface.Name, " udp4")
+		}
 		return packetConn, &net.UDPAddr{IP: mdnsGroupIPv4, Port: mdnsPort}, nil
 	case "udp6":
-		packetConn, err := listenConfig.ListenPacket(ctx, "udp6", "[::]:0")
+		packetConn, err := listenMDNSPacket(ctx, listenConfig, "udp6", listenAddress)
 		if err != nil {
 			return nil, nil, E.Cause(err, "mdns: listen on ", target.iface.Name, " udp6")
 		}
@@ -265,10 +286,26 @@ func (t *Transport) listenPacket(ctx context.Context, target queryTarget) (net.P
 			return nil, nil, E.Cause(err, "mdns: set multicast interface on ", target.iface.Name, " udp6")
 		}
 		_ = ipv6Conn.SetMulticastHopLimit(255)
+		err = ipv6Conn.JoinGroup(&netInterface, &net.UDPAddr{IP: mdnsGroupIPv6})
+		if err != nil {
+			packetConn.Close()
+			return nil, nil, E.Cause(err, "mdns: join multicast group on ", target.iface.Name, " udp6")
+		}
 		return packetConn, &net.UDPAddr{IP: mdnsGroupIPv6, Port: mdnsPort, Zone: target.iface.Name}, nil
 	default:
 		return nil, nil, E.New("mdns: unknown network: ", target.family)
 	}
+}
+
+// listenMDNSPacket binds the mDNS port, falling back to an ephemeral port when
+// another process holds 5353 exclusively. The fallback keeps the previous
+// behaviour (which still works with responders sending unicast replies).
+func listenMDNSPacket(ctx context.Context, listenConfig net.ListenConfig, network, address string) (net.PacketConn, error) {
+	packetConn, err := listenConfig.ListenPacket(ctx, network, address)
+	if err == nil || !errors.Is(err, syscall.EADDRINUSE) {
+		return packetConn, err
+	}
+	return listenConfig.ListenPacket(ctx, network, net.JoinHostPort("", "0"))
 }
 
 func (t *Transport) queryTargets() ([]queryTarget, error) {
